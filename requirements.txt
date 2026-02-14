@@ -1,0 +1,22 @@
+numpy>=1.26
+opencv-python>=4.10
+pillow>=10.4
+psutil>=6.0
+
+# OCR
+paddleocr==3.4.0
+easyocr>=1.7
+
+# Runtime Paddle (PP-OCRv5 validé)
+paddlepaddle==3.1.1
+
+# Vision + translation
+torch>=2.10
+torchvision>=0.25
+torchaudio>=2.10
+ultralytics>=8.3
+transformers<5
+sentencepiece>=0.2
+
+# Inpainting
+simple-lama-inpainting>=0.1.2

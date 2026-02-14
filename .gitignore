@@ -1,0 +1,25 @@
+# Environnement virtuel (le dossier lourd)
+venv_v5_final/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environnement
+.env
+.venv
+env/
+venv/
+.venv311 
+# IDE (VS Code, PyCharm)
+.vscode/
+.idea/
+
+# Logs et temporaires
+*.log
+assets/cache/
+assets/models/
+output/
+output 0/
+input/
