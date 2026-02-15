@@ -32,10 +32,16 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cu124 --prefe
 # Optional VRAM optimization (NLLB 4-bit/8-bit)
 RUN pip install bitsandbytes accelerate
 
+# PaddleOCR-VL v1.5 dependencies
+RUN pip install "paddlex[ocr]"
+
 COPY . .
 
 # Defaults aimed at low VRAM GPUs
 ENV WEBTOON_USE_BLACK_PADDING=false \
+    WEBTOON_TRANSLATION_BACKEND=local_llm \
+    WEBTOON_LLM_MODEL=Qwen/Qwen2.5-3B-Instruct \
+    WEBTOON_LLM_REQUIRE_CUDA=true \
     WEBTOON_USE_BITSANDBYTES=true \
     WEBTOON_BNB_4BIT=true \
     WEBTOON_BNB_8BIT=false

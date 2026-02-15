@@ -1,4 +1,5 @@
 from .detector import YOLODetector, Detection
+from .segmenter import SmartSegmenter
 from .ocr import OCREngine
 from .renderer import TextRenderer
 from .translator import NLLBTranslator 
@@ -9,6 +10,7 @@ Translator = NLLBTranslator
 __all__ = [
     'YOLODetector', 
     'Detection',
+    'SmartSegmenter',
     'OCREngine', 
     'TextRenderer',
     'Translator', 

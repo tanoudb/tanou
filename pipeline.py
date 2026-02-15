@@ -15,7 +15,7 @@ import json
 
 from config import config
 from utils import MemoryManager, model_context, memory_profiler, WebtoonLogger
-from core import YOLODetector, OCREngine, NLLBTranslator, TextRenderer, Detection
+from core import YOLODetector, OCREngine, NLLBTranslator, TextRenderer, Detection, SmartSegmenter
 from core.dll_manager import setup_nvidia_environment
 
 # Couleurs par classe pour le debug (v3 + legacy v2)
@@ -63,6 +63,8 @@ class TranslationPipeline:
         except Exception as e:
             self.logger.error(f"Échec initialisation OCR: {e}")
             self.ocr_engine = None
+
+        self.segmenter = SmartSegmenter(logger=self.logger)
 
     def _sort_detections_reading_order(self, detections: List[Detection]) -> List[Detection]:
         """Tri lecture naturelle: haut→bas, puis gauche→droite par ligne."""
@@ -140,6 +142,31 @@ class TranslationPipeline:
         ocr_conf = min(1.0, max(0.0, float(ocr_conf)))
         lang_conf = min(1.0, max(0.0, float(lang_conf)))
         return round(0.35 * det_score + 0.45 * ocr_conf + 0.20 * lang_conf, 3)
+
+    @staticmethod
+    def _extract_ocr_lines_from_regions(text_regions: List[Dict]) -> List[str]:
+        if not text_regions:
+            return []
+
+        ranked = []
+        for region in text_regions:
+            text = (region.get('text') or '').strip()
+            poly = region.get('bbox')
+            if not text or not poly or len(poly) < 3:
+                continue
+            try:
+                ys = [float(p[1]) for p in poly]
+                y_center = sum(ys) / max(1, len(ys))
+            except Exception:
+                y_center = 0.0
+            ranked.append((y_center, text))
+
+        ranked.sort(key=lambda x: x[0])
+        lines: List[str] = []
+        for _, txt in ranked:
+            if txt not in lines:
+                lines.append(txt)
+        return lines
     
     # ─────────────────────────────────────────────────────────────────────────
     # DEBUG : Visualisation détections
@@ -256,6 +283,233 @@ class TranslationPipeline:
                 f.write("\n")
         
         self.logger.info(f"   🐛 Résultats OCR: {ocr_path}")
+
+    @staticmethod
+    def _wrap_debug_text(text: str, max_chars: int = 52) -> List[str]:
+        words = (text or "").split()
+        if not words:
+            return [""]
+
+        lines: List[str] = []
+        current: List[str] = []
+        current_len = 0
+        for word in words:
+            add_len = len(word) + (1 if current else 0)
+            if current and (current_len + add_len) > max_chars:
+                lines.append(" ".join(current))
+                current = [word]
+                current_len = len(word)
+            else:
+                current.append(word)
+                current_len += add_len
+
+        if current:
+            lines.append(" ".join(current))
+        return lines
+
+    @staticmethod
+    def _estimate_debug_text_color(img: np.ndarray, det: Detection) -> Tuple[int, int, int]:
+        fallback = DEBUG_COLORS.get(getattr(det, 'class_name', ''), (255, 255, 255))
+        text_regions = getattr(det, 'text_regions', None) or []
+
+        x1, y1, x2, y2 = det.x1, det.y1, det.x2, det.y2
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0 or not text_regions:
+            return fallback
+
+        h, w = crop.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for region in text_regions:
+            pts = region.get('bbox') if isinstance(region, dict) else None
+            if not pts:
+                continue
+            arr = np.array(pts, dtype=np.int32)
+            if arr.ndim != 2 or arr.shape[0] < 3:
+                continue
+            arr[:, 0] = np.clip(arr[:, 0], 0, max(0, w - 1))
+            arr[:, 1] = np.clip(arr[:, 1], 0, max(0, h - 1))
+            cv2.fillPoly(mask, [arr], 255)
+
+        if np.sum(mask) == 0:
+            return fallback
+
+        pixels = crop[mask > 0]
+        if pixels.size == 0:
+            return fallback
+
+        bgr = np.median(pixels.reshape(-1, 3), axis=0)
+        return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+
+    def save_debug_double_page_ocr(self, img: np.ndarray, output_dir: Path, image_name: str,
+                                   detections: List[Detection]):
+        """
+        Génère une vue debug double-page orientée crops (lisibilité maximale):
+        - gauche: crop OCR zoomé, surligné avec régions OCR
+        - droite: feuille blanche, retranscription OCR encadrée en couleur
+        - indicateurs couleur + confiance visibles sur chaque ligne
+        """
+        if img is None or img.size == 0:
+            return
+
+        debug_dir = output_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        ordered = [d for d in self._sort_detections_reading_order(detections) if getattr(d, 'text_original', None)]
+        if not ordered:
+            return
+
+        margin = 16
+        gap = 16
+        header_h = 56
+        row_h = 232
+        left_w = 920
+        right_w = 920
+        total_w = margin + left_w + gap + right_w + margin
+        total_h = header_h + margin + len(ordered) * (row_h + gap)
+
+        page = np.full((total_h, total_w, 3), 245, dtype=np.uint8)
+
+        cv2.putText(page, "OCR Debug (Crop-based Double Page)", (margin, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (20, 20, 20), 2, cv2.LINE_AA)
+        cv2.putText(page, "Left: OCR crop highlighted | Right: OCR transcript + color/confidence",
+                    (margin, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (40, 40, 40), 1, cv2.LINE_AA)
+
+        y_cursor = header_h + margin
+        for idx, det in enumerate(ordered, start=1):
+            color = self._estimate_debug_text_color(img, det)
+            class_name = str(getattr(det, 'class_name', 'text'))
+
+            lx1, ly1 = margin, y_cursor
+            lx2, ly2 = lx1 + left_w, y_cursor + row_h
+            rx1, ry1 = lx2 + gap, y_cursor
+            rx2, ry2 = rx1 + right_w, y_cursor + row_h
+
+            # Cartes de fond colorées (léger tint)
+            tint = np.array(color, dtype=np.float32)
+            left_tint = np.clip((0.10 * tint + 0.90 * np.array([255, 255, 255])), 0, 255).astype(np.uint8)
+            right_tint = np.clip((0.06 * tint + 0.94 * np.array([255, 255, 255])), 0, 255).astype(np.uint8)
+
+            page[ly1:ly2, lx1:lx2] = left_tint
+            page[ry1:ry2, rx1:rx2] = right_tint
+            cv2.rectangle(page, (lx1, ly1), (lx2, ly2), color, 3)
+            cv2.rectangle(page, (rx1, ry1), (rx2, ry2), color, 3)
+
+            # Crop OCR
+            crop = img[det.y1:det.y2, det.x1:det.x2].copy()
+            if crop.size > 0:
+                for region in getattr(det, 'text_regions', None) or []:
+                    raw = region.get('bbox') if isinstance(region, dict) else None
+                    if not raw:
+                        continue
+                    pts = np.array(raw, dtype=np.int32)
+                    if pts.ndim != 2 or pts.shape[0] < 3:
+                        continue
+                    pts[:, 0] = np.clip(pts[:, 0], 0, max(0, crop.shape[1] - 1))
+                    pts[:, 1] = np.clip(pts[:, 1], 0, max(0, crop.shape[0] - 1))
+                    cv2.polylines(crop, [pts], True, color, 2, cv2.LINE_AA)
+
+                inner_pad = 14
+                slot_w = max(10, left_w - 2 * inner_pad)
+                slot_h = max(10, row_h - 2 * inner_pad - 28)
+                ch, cw = crop.shape[:2]
+                scale = min(slot_w / max(1, cw), slot_h / max(1, ch))
+                if scale <= 0:
+                    scale = 1.0
+                nw = max(1, int(cw * scale))
+                nh = max(1, int(ch * scale))
+                crop_rs = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA)
+
+                px = lx1 + inner_pad + (slot_w - nw) // 2
+                py = ly1 + 30 + inner_pad + (slot_h - nh) // 2
+                page[py:py + nh, px:px + nw] = crop_rs
+
+            cv2.putText(page, f"#{idx}  {class_name}  conf={det.ocr_confidence:.0%}",
+                        (lx1 + 12, ly1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+            # Panneau transcript (droite)
+            text = (det.text_original or "").strip() or "(none)"
+            lines = self._wrap_debug_text(text, max_chars=66)
+
+            cv2.putText(page, "OCR transcript", (rx1 + 12, ry1 + 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (25, 25, 25), 1, cv2.LINE_AA)
+
+            # carré couleur + score (en haut à droite de la carte)
+            sw = 18
+            cv2.rectangle(page, (rx2 - 170, ry1 + 8), (rx2 - 170 + sw, ry1 + 8 + sw), color, -1)
+            cv2.rectangle(page, (rx2 - 170, ry1 + 8), (rx2 - 170 + sw, ry1 + 8 + sw), (0, 0, 0), 1)
+            cv2.putText(page, f"{det.ocr_confidence:.0%}", (rx2 - 145, ry1 + 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (20, 20, 20), 1, cv2.LINE_AA)
+
+            text_y = ry1 + 52
+            for line in lines[:6]:
+                cv2.putText(page, line, (rx1 + 14, text_y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.58, (15, 15, 15), 1, cv2.LINE_AA)
+                text_y += 28
+
+            y_cursor += row_h + gap
+
+        double_page = page
+        out_path = debug_dir / f"{image_name}_ocr_double_page.png"
+        cv2.imwrite(str(out_path), double_page)
+        self.logger.info(f"   🐛 Debug double-page OCR: {out_path}")
+
+    def save_debug_mask_bundle(
+        self,
+        img: np.ndarray,
+        output_dir: Path,
+        image_name: str,
+        index: int,
+        det: Detection,
+        mask_regions: Optional[List[Dict]],
+    ) -> None:
+        """Sauvegarde crop original + masque segmenté pour debug fin."""
+        debug_dir = output_dir / "debug" / f"{image_name}_pipeline"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        crop = img[det.y1:det.y2, det.x1:det.x2]
+        if crop.size == 0:
+            return
+
+        cv2.imwrite(str(debug_dir / f"{index:02d}_crop.png"), crop)
+
+        h, w = crop.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for region in mask_regions or []:
+            pts = region.get('bbox') if isinstance(region, dict) else None
+            if not pts:
+                continue
+            arr = np.array(pts, dtype=np.int32)
+            if arr.ndim != 2 or arr.shape[0] < 3:
+                continue
+            arr[:, 0] = np.clip(arr[:, 0], 0, max(0, w - 1))
+            arr[:, 1] = np.clip(arr[:, 1], 0, max(0, h - 1))
+            cv2.fillPoly(mask, [arr], 255)
+
+        cv2.imwrite(str(debug_dir / f"{index:02d}_mask.png"), mask)
+
+    def save_debug_render_bundle(
+        self,
+        output_dir: Path,
+        image_name: str,
+        index: int,
+        before_crop: np.ndarray,
+        after_crop: np.ndarray,
+        det: Detection,
+    ) -> None:
+        debug_dir = output_dir / "debug" / f"{image_name}_pipeline"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        cv2.imwrite(str(debug_dir / f"{index:02d}_render_before.png"), before_crop)
+        cv2.imwrite(str(debug_dir / f"{index:02d}_render_after.png"), after_crop)
+
+        text_path = debug_dir / f"{index:02d}_texts.txt"
+        with open(text_path, 'w', encoding='utf-8') as f:
+            f.write(f"class: {det.class_name}\n")
+            f.write(f"bbox: {det.bbox}\n")
+            f.write(f"ocr: {det.text_original or ''}\n")
+            f.write(f"translation: {det.text_translated or ''}\n")
+            f.write(f"style: {getattr(det, 'text_style', 'dialogue')}\n")
+            f.write(f"mask_regions: {len(getattr(det, 'mask_regions', []) or [])}\n")
     
     # ─────────────────────────────────────────────────────────────────────────
     # TRAITEMENT IMAGE UNIQUE
@@ -373,6 +627,68 @@ class TranslationPipeline:
                 self.logger.warning(f"   ⚠️  OCR global predict failed: {e}")
                 vl_regions = []
 
+            # Récupération des zones potentiellement manquées par YOLO via OCR global
+            if vl_regions:
+                recovered = 0
+
+                def _iou_ratio(box_a, box_b):
+                    xA = max(box_a[0], box_b[0])
+                    yA = max(box_a[1], box_b[1])
+                    xB = min(box_a[2], box_b[2])
+                    yB = min(box_a[3], box_b[3])
+                    inter = max(0, xB - xA) * max(0, yB - yA)
+                    area = max(1, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
+                    return inter / area
+
+                existing_boxes = [[d.x1, d.y1, d.x2, d.y2] for d in translatable_detections]
+                for region in vl_regions:
+                    rbox = region.get('bbox')
+                    rtext = (region.get('text') or '').strip()
+                    rconf = float(region.get('conf', 0.0) or 0.0)
+                    if not rbox or len(rbox) != 4 or not rtext:
+                        continue
+
+                    rw = max(1, int(rbox[2] - rbox[0]))
+                    rh = max(1, int(rbox[3] - rbox[1]))
+                    area = rw * rh
+
+                    words = [w for w in rtext.replace("\n", " ").split(" ") if w.strip()]
+                    looks_fragment = len(words) < 4 or len(rtext) < 20
+
+                    # skip fragments en MAJUSCULES très courts (souvent morceaux de bulle déjà couverte)
+                    letters = [c for c in rtext if c.isalpha()]
+                    upper_ratio = (sum(1 for c in letters if c.isupper()) / max(1, len(letters))) if letters else 0.0
+                    if upper_ratio > 0.9 and len(words) <= 4:
+                        looks_fragment = True
+
+                    if rconf < 0.85 or area < 12000 or looks_fragment:
+                        continue
+
+                    overlap = max((_iou_ratio(rbox, b) for b in existing_boxes), default=0.0)
+                    if overlap > 0.20:
+                        continue
+
+                    margin = 16
+                    x1 = max(0, int(rbox[0]) - margin)
+                    y1 = max(0, int(rbox[1]) - margin)
+                    x2 = min(w, int(rbox[2]) + margin)
+                    y2 = min(h, int(rbox[3]) + margin)
+                    if x2 - x1 < 20 or y2 - y1 < 20:
+                        continue
+
+                    pseudo = Detection(class_name='out_text', bbox=[x1, y1, x2, y2], score=max(0.35, min(0.80, rconf)))
+                    translatable_detections.append(pseudo)
+                    existing_boxes.append([x1, y1, x2, y2])
+                    recovered += 1
+
+                    if recovered >= 3:
+                        break
+
+                if recovered > 0:
+                    translatable_detections = self._sort_detections_reading_order(translatable_detections)
+                    stats['translatable'] = len(translatable_detections)
+                    self.logger.info(f"   🩹 Zones récupérées via OCR global: +{recovered}")
+
             if not vl_regions:
                 self.logger.info("   ℹ️  Aucun résultat OCR global — fallback par crop individuel")
 
@@ -448,6 +764,10 @@ class TranslationPipeline:
                         det.text_regions = []
 
                     self.logger.info(f"      ✓ \"{text}\" ({conf:.0%}) [{self.ocr_engine.get_backend_name()}]")
+
+                    det.mask_regions = self.segmenter.segment_detection(img, det, det.text_regions)
+                    if self.debug:
+                        self.save_debug_mask_bundle(img, output_dir, image_stem, i + 1, det, det.mask_regions)
                     continue
 
                 # Si aucune région OCR globale valide, fallback: OCR sur crop
@@ -474,6 +794,13 @@ class TranslationPipeline:
 
                 det.text_original = text
                 det.text_regions = text_regions
+                det.ocr_lines = self._extract_ocr_lines_from_regions(text_regions)
+
+                det.mask_regions = self.segmenter.segment_detection(img, det, text_regions)
+
+                if self.debug:
+                    self.save_debug_mask_bundle(img, output_dir, image_stem, i + 1, det, det.mask_regions)
+
                 self.logger.info(f"      ✓ \"{text}\" ({confidence:.0%}) [{len(text_regions)} régions, {ocr_strategy}]")
         
         # Filtrer détections sans texte
@@ -532,10 +859,13 @@ class TranslationPipeline:
                     det.source_lang_confidence = lang_conf
                     det.global_confidence = self._compute_global_confidence(det.score, det.ocr_confidence, lang_conf)
 
-                if config.translation.enable_context_grouping:
-                    groups = translator.group_detections_by_context(valid_detections)
+                system_detections = [d for d in valid_detections if str(getattr(d, 'class_name', '')).lower() == 'system']
+                regular_detections = [d for d in valid_detections if str(getattr(d, 'class_name', '')).lower() != 'system']
+
+                if config.translation.enable_context_grouping and regular_detections:
+                    groups = translator.group_detections_by_context(regular_detections)
                     self.logger.info(
-                        f"\n   🌍 Traduction contextuelle ({len(valid_detections)} bulles → {len(groups)} groupes)"
+                        f"\n   🌍 Traduction contextuelle ({len(regular_detections)} bulles → {len(groups)} groupes)"
                     )
                     for group_idx, group in enumerate(groups, start=1):
                         translator.translate_group(group)
@@ -543,14 +873,38 @@ class TranslationPipeline:
                             f"      Groupe {group_idx}/{len(groups)}: {len(group.detections)} bulle(s)"
                         )
                 else:
-                    self.logger.info(f"\n   🌍 Traduction individuelle ({len(texts_to_translate)} bulles)")
+                    self.logger.info(f"\n   🌍 Traduction individuelle ({len(regular_detections)} bulles)")
 
                     # Traduire simplement bulle par bulle
-                    translations = translator.translate_batch(texts_to_translate)
+                    translations = translator.translate_batch([d.text_original for d in regular_detections])
 
                     # Assigner les traductions
-                    for det, trans in zip(valid_detections, translations):
+                    for det, trans in zip(regular_detections, translations):
                         det.text_translated = trans
+
+                # Traduction spécifique des cartes System: conserver structure titre + description
+                for det in system_detections:
+                    lines = [ln.strip() for ln in getattr(det, 'ocr_lines', []) if ln and ln.strip()]
+                    if len(lines) >= 2:
+                        raw_title = lines[0]
+                        raw_body = " ".join(lines[1:])
+
+                        title_for_translation = raw_title
+                        if raw_title.isupper() and len(raw_title.split()) <= 5:
+                            title_for_translation = raw_title.title()
+
+                        body_for_translation = raw_body
+                        if raw_body.isupper():
+                            body_for_translation = raw_body.lower().capitalize()
+
+                        title_tr = translator.translate(title_for_translation).strip()
+                        body_tr = translator.translate(body_for_translation).strip()
+                        if title_tr and body_tr:
+                            det.text_translated = f"{title_tr}\n{body_tr}"
+                        else:
+                            det.text_translated = translator.translate(det.text_original or "")
+                    else:
+                        det.text_translated = translator.translate(det.text_original or "")
                 
                 cache_stats = translator.get_cache_stats()
                 if cache_stats:
@@ -563,6 +917,7 @@ class TranslationPipeline:
         # ── DEBUG : sauvegarder résultats OCR + traduction ──
         if self.debug:
             self.save_debug_ocr(output_dir, image_stem, translatable_detections)
+            self.save_debug_double_page_ocr(img, output_dir, image_stem, valid_detections)
         
         # ─────────────────────────────────────────────────────────────────
         # PHASE 4 : RENDERING
@@ -576,15 +931,51 @@ class TranslationPipeline:
         for i, det in enumerate(valid_detections):
             if not det.text_translated:
                 continue
+
+            det.text_style = renderer.infer_text_style(
+                det.text_translated,
+                det.x2 - det.x1,
+                det.y2 - det.y1,
+                class_name=det.class_name,
+            )
+            det.text_color_rgb = renderer.extract_original_text_color(
+                img,
+                det.x1,
+                det.y1,
+                det.x2,
+                det.y2,
+                getattr(det, 'mask_regions', None) or getattr(det, 'text_regions', None),
+            )
+            det.font_hint = renderer.detect_font_hint(
+                img,
+                det.x1,
+                det.y1,
+                det.x2,
+                det.y2,
+                getattr(det, 'mask_regions', None) or getattr(det, 'text_regions', None),
+            )
             
             self.logger.info(f"   [{i+1}/{len(valid_detections)}] \"{det.text_translated}\"")
+
+            before_crop = None
+            if self.debug:
+                before_crop = img_translated[det.y1:det.y2, det.x1:det.x2].copy()
             
             img_translated = renderer.render_text(
                 img_translated,
                 det.text_translated,
                 det.x1, det.y1, det.x2, det.y2,
-                text_regions=getattr(det, 'text_regions', None)
+                text_regions=getattr(det, 'text_regions', None),
+                mask_regions=getattr(det, 'mask_regions', None),
+                text_color_rgb=getattr(det, 'text_color_rgb', None),
+                text_style=getattr(det, 'text_style', 'dialogue'),
+                font_hint=getattr(det, 'font_hint', 'regular'),
+                class_name=getattr(det, 'class_name', '')
             )
+
+            if self.debug and before_crop is not None:
+                after_crop = img_translated[det.y1:det.y2, det.x1:det.x2].copy()
+                self.save_debug_render_bundle(output_dir, image_stem, i + 1, before_crop, after_crop, det)
         
         # Sauvegarder
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -607,6 +998,10 @@ class TranslationPipeline:
                     'bbox': d.bbox,
                     'original': d.text_original,
                     'translated': d.text_translated,
+                    'mask_regions_count': len(getattr(d, 'mask_regions', []) or []),
+                    'text_style': getattr(d, 'text_style', 'dialogue'),
+                    'text_color_rgb': getattr(d, 'text_color_rgb', None),
+                    'font_hint': getattr(d, 'font_hint', 'regular'),
                     'confidence': d.ocr_confidence,
                     'detection_confidence': d.score,
                     'source_lang_detected': getattr(d, 'source_lang_detected', config.translation.source_lang),

@@ -17,17 +17,18 @@ from config import config
 from utils import ImageUtils, TextFilter
 
 # Imports des backends
-from .backends import OCRBackend, PPOCRv5Backend, EasyOCRBackend
+from .backends import OCRBackend, PaddleOCRVLV15Backend, PPOCRv5Backend, EasyOCRBackend
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PRIORITÉ DES BACKENDS
 # ═════════════════════════════════════════════════════════════════════════════
 
-BACKEND_PRIORITY = [
-    ('ppocr-v5', PPOCRv5Backend),
-    ('easyocr',      EasyOCRBackend),
-]
+BACKEND_REGISTRY = {
+    'paddleocr-vl-v1.5': PaddleOCRVLV15Backend,
+    'ppocr-v5': PPOCRv5Backend,
+    'easyocr': EasyOCRBackend,
+}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -55,6 +56,8 @@ class OCREngine:
         self.cfg = config.ocr
         self.paddle_env_path = paddle_env_path or getattr(config, 'paddle_env_path', None)
         self.backend: Optional[OCRBackend] = None
+        self.primary_backend: Optional[OCRBackend] = None
+        self.fallback_backends: List[OCRBackend] = []
         
         # Utilise le TextFilter du projet
         self.text_filter = TextFilter(
@@ -63,7 +66,7 @@ class OCREngine:
         )
         
         # Chargement du backend
-        self._load_best_backend()
+        self._load_backends_chain()
     
     def predict_full_image(self, image_path: Path) -> List[Dict]:
         """
@@ -71,49 +74,60 @@ class OCREngine:
         Pour l'instant, on laisse le pipeline faire le fallback par crop 
         car c'est plus précis sur les longs webtoons.
         """
-        # IMPORTANT : Retourner une liste vide [] et non None pour éviter le crash
+        if self.backend is None:
+            return []
+        try:
+            predictor = getattr(self.backend, 'predict_full_image', None)
+            if callable(predictor):
+                regions = predictor(image_path)
+                return regions if regions else []
+        except Exception:
+            return []
         return []
     
-    def _load_best_backend(self):
-        """Charge le meilleur backend disponible"""
-        # Forçage si config.ocr.backend est défini
-        forced = getattr(self.cfg, 'backend', None)
-        if forced:
-            for name, backend_class in BACKEND_PRIORITY:
-                if name == forced:
-                    try:
-                        backend = backend_class()
-                        self._initialize_backend(backend)
-                        self.backend = backend
-                        print(f"✅ Backend forcé '{forced}' chargé sur {self.device}")
-                        return
-                    except Exception as e:
-                        print(f"⚠️  Backend forcé '{forced}' échoué: {e}")
-                        tb.print_exc()
-                        print("   → Passage au fallback automatique...")
-                        break
-        
-        # Auto-sélection par ordre de priorité
-        for name, backend_class in BACKEND_PRIORITY:
+    def _load_backends_chain(self):
+        primary_name = (getattr(self.cfg, 'backend', None) or getattr(self.cfg, 'primary_backend', None) or 'paddleocr-vl-v1.5').strip().lower()
+        fallback_names = [
+            str(name).strip().lower()
+            for name in getattr(self.cfg, 'fallback_backends', ['ppocr-v5', 'easyocr'])
+            if str(name).strip()
+        ]
+        fallback_names = [name for name in fallback_names if name != primary_name]
+
+        load_order = [primary_name] + fallback_names
+        loaded: List[Tuple[str, OCRBackend]] = []
+
+        for name in load_order:
+            backend_class = BACKEND_REGISTRY.get(name)
+            if backend_class is None:
+                print(f"   ⚠️  Backend OCR inconnu: {name}")
+                continue
             try:
                 backend = backend_class()
                 self._initialize_backend(backend)
-                self.backend = backend
-                print(f"✅ Backend OCR: {backend.name} sur {self.device}")
-                return
+                loaded.append((name, backend))
+                print(f"✅ Backend OCR chargé: {backend.name} sur {self.device}")
             except ImportError:
                 print(f"   ℹ️  {name} non installé, essai suivant...")
             except Exception as e:
                 print(f"   ⚠️  {name} erreur: {e}")
                 tb.print_exc()
-                print(f"   → Essai suivant...")
-        
-        raise RuntimeError(
-            "Aucun backend OCR disponible !\n"
-            "Installation:\n"
-            "  PP-OCRv5: pip install paddleocr paddlepaddle-gpu\n"
-            "  EasyOCR:      pip install easyocr"
-        )
+                print("   → Essai suivant...")
+
+        if not loaded:
+            raise RuntimeError(
+                "Aucun backend OCR disponible !\n"
+                "Installation:\n"
+                "  PaddleOCR-VL/PP-OCRv5: pip install paddleocr paddlepaddle\n"
+                "  EasyOCR: pip install easyocr"
+            )
+
+        self.primary_backend = loaded[0][1]
+        self.fallback_backends = [backend for _, backend in loaded[1:]]
+        self.backend = self.primary_backend
+
+        chain_names = [backend.name for _, backend in loaded]
+        print(f"🧩 Chaîne OCR active: {' -> '.join(chain_names)}")
     
     def _initialize_backend(self, backend: OCRBackend):
         """
@@ -122,7 +136,7 @@ class OCREngine:
         Args:
             backend: Instance du backend à initialiser
         """
-        if isinstance(backend, PPOCRv5Backend):
+        if isinstance(backend, (PPOCRv5Backend, PaddleOCRVLV15Backend)):
             # PP-OCRv5 peut nécessiter le chemin de l'env pour gestion DLL
             backend.load(self.device, paddle_env_path=self.paddle_env_path)
         
@@ -301,14 +315,32 @@ class OCREngine:
         # Prétraitement avec coefficient
         img_proc, upscale_factor = self.preprocess_image(img)
         
-        # OCR - Paddle ou fallback
-        text, confidence, text_regions = self.backend.read_text(img_proc)
+        min_primary_conf = float(getattr(self.cfg, 'fallback_min_confidence', 0.72))
+
+        text, confidence, text_regions = self.primary_backend.read_text(img_proc)
         
         # Post-traitement
         text = self.post_process_text(text)
         
         # Validation
         is_valid, skip_reason = self.is_valid_text(text, confidence)
+
+        if is_valid and confidence >= min_primary_conf:
+            return text, confidence, True, None, text_regions, upscale_factor
+
+        best = (text, confidence, is_valid, skip_reason, text_regions)
+
+        for backend in self.fallback_backends:
+            fb_text, fb_confidence, fb_regions = backend.read_text(img_proc)
+            fb_text = self.post_process_text(fb_text)
+            fb_valid, fb_reason = self.is_valid_text(fb_text, fb_confidence)
+
+            if fb_valid and (not best[2] or fb_confidence > best[1]):
+                best = (fb_text, fb_confidence, fb_valid, fb_reason, fb_regions)
+                if fb_confidence >= min_primary_conf:
+                    break
+
+        text, confidence, is_valid, skip_reason, text_regions = best
         
         if not is_valid:
             return None, confidence, False, skip_reason, [], upscale_factor
@@ -319,11 +351,16 @@ class OCREngine:
     
     def get_backend_name(self) -> str:
         """Retourne le nom du backend actuellement chargé"""
-        return self.backend.name if self.backend else "none"
+        if not self.primary_backend:
+            return "none"
+        if not self.fallback_backends:
+            return self.primary_backend.name
+        return f"{self.primary_backend.name} (+{len(self.fallback_backends)} fallback)"
     
     # ── Nettoyage ─────────────────────────────────────────────────────────────
     
     def __del__(self):
         """Décharge proprement le backend"""
-        if self.backend:
-            self.backend.unload()
+        for backend in [self.primary_backend, *self.fallback_backends]:
+            if backend:
+                backend.unload()

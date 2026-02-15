@@ -26,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import Tuple, Optional, List, Dict
 from pathlib import Path
 import math
+import re
 
 import sys
 from pathlib import Path
@@ -84,6 +85,38 @@ class TextRenderer:
             return ImageFont.load_default()
         except:
             return None
+
+    def get_font_for_style(self, size: int, style: str = "dialogue", font_hint: str = "regular") -> Optional[ImageFont.FreeTypeFont]:
+        if not self.fonts:
+            return self.get_font(size)
+
+        style = (style or "dialogue").lower()
+        keyword_map = {
+            "scream": ["cris", "sfx", "expressive", "trash", "creepy"],
+            "whisper": ["lower", "light", "thin"],
+            "narration": ["special", "spéciales", "serif"],
+            "dialogue": ["bulles", "classiques"],
+        }
+
+        hint_map = {
+            "bold": ["cris", "trash", "expressive", "creepy"],
+            "thin": ["lower", "light", "thin", "system"],
+            "regular": ["bulles", "classiques", "system"],
+        }
+
+        preferred = keyword_map.get(style, keyword_map["dialogue"]) + hint_map.get(font_hint, [])
+        ordered_paths = sorted(
+            self.fonts,
+            key=lambda p: 0 if any(k in str(p).lower() for k in preferred) else 1,
+        )
+
+        for font_path in ordered_paths:
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                continue
+
+        return self.get_font(size)
     
     def _get_inner_zone(self, x1: int, y1: int, x2: int, y2: int, 
                          img_shape: Tuple[int, ...]) -> Tuple[int, int, int, int]:
@@ -170,9 +203,15 @@ class TextRenderer:
             crop_inpainted = self._inpaint_lama(crop, mask)
         else:
             crop_inpainted = cv2.inpaint(crop, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+
+        # ── Blend doux (évite les bords visibles / arrachement visuel) ──
+        alpha = cv2.GaussianBlur(mask, (0, 0), sigmaX=3.0, sigmaY=3.0).astype(np.float32) / 255.0
+        alpha = np.clip(alpha, 0.0, 1.0)
+        alpha = np.expand_dims(alpha, axis=2)
+        crop_blended = (crop.astype(np.float32) * (1.0 - alpha) + crop_inpainted.astype(np.float32) * alpha).astype(np.uint8)
         
         # ── Remettre le crop dans l'image ──
-        img[crop_y1:crop_y2, crop_x1:crop_x2] = crop_inpainted
+        img[crop_y1:crop_y2, crop_x1:crop_x2] = crop_blended
         
         return img
     
@@ -191,6 +230,189 @@ class TextRenderer:
             result = cv2.resize(result, (w_orig, h_orig), interpolation=cv2.INTER_LANCZOS4)
         
         return result
+
+    def _build_local_mask_from_regions(self, width: int, height: int, regions: Optional[List[Dict]]) -> np.ndarray:
+        mask = np.zeros((height, width), dtype=np.uint8)
+        if not regions:
+            return mask
+
+        for region in regions:
+            raw = region.get('bbox') if isinstance(region, dict) else None
+            if not raw:
+                continue
+            pts = np.array(raw, dtype=np.int32)
+            if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] < 2:
+                continue
+            pts[:, 0] = np.clip(pts[:, 0], 0, max(0, width - 1))
+            pts[:, 1] = np.clip(pts[:, 1], 0, max(0, height - 1))
+            cv2.fillPoly(mask, [pts], 255)
+
+        return mask
+
+    def _compute_anchor_box_from_regions(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        regions: Optional[List[Dict]] = None,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if not regions:
+            return None
+
+        pts = []
+        for region in regions:
+            raw = region.get('bbox') if isinstance(region, dict) else None
+            if not raw:
+                continue
+            arr = np.array(raw, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[0] < 3 or arr.shape[1] < 2:
+                continue
+            for p in arr:
+                pts.append((int(x1 + p[0]), int(y1 + p[1])))
+
+        if len(pts) < 3:
+            return None
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        ax1 = max(x1, min(xs))
+        ay1 = max(y1, min(ys))
+        ax2 = min(x2, max(xs))
+        ay2 = min(y2, max(ys))
+
+        if ax2 - ax1 < 8 or ay2 - ay1 < 8:
+            return None
+
+        pad = 2
+        ax1 = max(x1, ax1 - pad)
+        ay1 = max(y1, ay1 - pad)
+        ax2 = min(x2, ax2 + pad)
+        ay2 = min(y2, ay2 + pad)
+        return (ax1, ay1, ax2, ay2)
+
+    def extract_original_text_color(
+        self,
+        img: np.ndarray,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        mask_regions: Optional[List[Dict]] = None,
+    ) -> Optional[Tuple[int, int, int]]:
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        local_mask = self._build_local_mask_from_regions(crop.shape[1], crop.shape[0], mask_regions)
+        if np.sum(local_mask) == 0:
+            return None
+
+        pixels = crop[local_mask > 0]
+        if pixels.size == 0:
+            return None
+
+        sample = pixels.astype(np.float32)
+        if sample.shape[0] > 4000:
+            idx = np.random.choice(sample.shape[0], 4000, replace=False)
+            sample = sample[idx]
+
+        try:
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 12, 1.0)
+            _, labels, centers = cv2.kmeans(sample, 2, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+            labels = labels.flatten()
+
+            counts = [np.sum(labels == i) for i in range(2)]
+            sat_scores = []
+            for i in range(2):
+                b, g, r = centers[i]
+                mx = max(float(r), float(g), float(b))
+                mn = min(float(r), float(g), float(b))
+                sat = (mx - mn) / max(1.0, mx)
+                sat_scores.append(sat)
+
+            # Favorise cluster texte (souvent plus saturé/contrasté)
+            pick = int(np.argmax(np.array(sat_scores) + 0.15 * (np.array(counts) / max(1, sum(counts)))))
+            bgr = centers[pick]
+        except Exception:
+            bgr = np.median(sample, axis=0)
+
+        return (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+
+    def detect_font_hint(
+        self,
+        img: np.ndarray,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        mask_regions: Optional[List[Dict]] = None,
+    ) -> str:
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            return "regular"
+
+        mask = self._build_local_mask_from_regions(crop.shape[1], crop.shape[0], mask_regions)
+        if np.sum(mask) == 0:
+            return "regular"
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 80, 180)
+
+        mask_pixels = np.sum(mask > 0)
+        if mask_pixels <= 0:
+            return "regular"
+
+        edge_density = float(np.sum((edges > 0) & (mask > 0))) / float(mask_pixels)
+
+        # Heuristique simple "font detector"
+        if edge_density > 0.32:
+            return "bold"
+        if edge_density < 0.15:
+            return "thin"
+        return "regular"
+
+    def infer_text_style(self, text: str, box_w: int, box_h: int, class_name: str = "") -> str:
+        if not self.cfg.auto_style_typesetting:
+            return "dialogue"
+
+        if str(class_name).lower() == "system":
+            return "system_card"
+
+        clean = (text or "").strip()
+        if not clean:
+            return "dialogue"
+
+        upper_ratio = sum(1 for c in clean if c.isupper()) / max(1, sum(1 for c in clean if c.isalpha()))
+        if "!" in clean and upper_ratio > 0.45:
+            return "scream"
+        if clean.startswith("(") or clean.startswith("["):
+            return "narration"
+        if box_h < 70 and len(clean) > 12:
+            return "whisper"
+        return "dialogue"
+
+    @staticmethod
+    def _format_system_card_text(text: str) -> str:
+        if not text:
+            return text
+        if "\n" in text:
+            return text
+
+        compact = re.sub(r"\s+", " ", text).strip()
+
+        # Cas courant: titre + description séparés par virgule ou point
+        if "," in compact:
+            left, right = compact.split(",", 1)
+            if 3 <= len(left.strip()) <= 42 and len(right.strip()) >= 8:
+                return f"{left.strip()}\n{right.strip()}"
+
+        if ". " in compact:
+            left, right = compact.split(". ", 1)
+            if 3 <= len(left.strip()) <= 42 and len(right.strip()) >= 8:
+                return f"{left.strip()}\n{right.strip()}"
+
+        return compact
     
     # ─────────────────────────────────────────────────────────────────────────
     # COULEURS
@@ -324,30 +546,101 @@ class TextRenderer:
     
     def render_text(self, img: np.ndarray, text: str, 
                      x1: int, y1: int, x2: int, y2: int,
-                     text_regions: Optional[List[Dict]] = None) -> np.ndarray:
-        img = self.inpaint_region(img, x1, y1, x2, y2, text_regions=text_regions)
-        img = self.insert_text(img, text, x1, y1, x2, y2)
+                     text_regions: Optional[List[Dict]] = None,
+                     mask_regions: Optional[List[Dict]] = None,
+                     text_color_rgb: Optional[Tuple[int, int, int]] = None,
+                     text_style: str = "dialogue",
+                     font_hint: str = "regular",
+                     class_name: str = "") -> np.ndarray:
+        effective_regions = mask_regions if mask_regions else text_regions
+
+        if text_color_rgb is None and self.cfg.preserve_original_text_color:
+            text_color_rgb = self.extract_original_text_color(img, x1, y1, x2, y2, effective_regions)
+
+        img = self.inpaint_region(img, x1, y1, x2, y2, text_regions=effective_regions)
+        img = self.insert_text(
+            img,
+            text,
+            x1,
+            y1,
+            x2,
+            y2,
+            text_regions=effective_regions,
+            text_color_rgb=text_color_rgb,
+            text_style=text_style,
+            font_hint=font_hint,
+            class_name=class_name,
+        )
         return img
     
-    def insert_text(self, img: np.ndarray, text: str, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+    def insert_text(
+        self,
+        img: np.ndarray,
+        text: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        text_regions: Optional[List[Dict]] = None,
+        text_color_rgb: Optional[Tuple[int, int, int]] = None,
+        text_style: str = "dialogue",
+        font_hint: str = "regular",
+        class_name: str = "",
+    ) -> np.ndarray:
         if not text:
             return img
-        
-        ix1, iy1, ix2, iy2 = self._get_inner_zone(x1, y1, x2, y2, img.shape)
+
+        use_locked_mode = bool(getattr(self.cfg, 'lock_text_to_ocr_regions', False))
+        system_only = bool(getattr(self.cfg, 'lock_text_system_only', True))
+        is_system = str(class_name).lower() == 'system'
+        if system_only and not is_system:
+            use_locked_mode = False
+
+        if use_locked_mode:
+            anchor_box = self._compute_anchor_box_from_regions(x1, y1, x2, y2, text_regions)
+            if anchor_box is not None:
+                ix1, iy1, ix2, iy2 = anchor_box
+            else:
+                ix1, iy1, ix2, iy2 = self._get_inner_zone(x1, y1, x2, y2, img.shape)
+        else:
+            ix1, iy1, ix2, iy2 = self._get_inner_zone(x1, y1, x2, y2, img.shape)
+
         tw, th = ix2 - ix1, iy2 - iy1
         if tw <= 0 or th <= 0:
             return img
         
-        text_color, outline_color = self.get_text_colors(img, x1, y1, x2, y2)
+        if text_color_rgb is None:
+            text_color, outline_color = self.get_text_colors(img, x1, y1, x2, y2)
+        else:
+            text_color = text_color_rgb
+            avg_luma = (text_color[0] + text_color[1] + text_color[2]) / 3
+            outline_color = (0, 0, 0) if avg_luma > 140 else (255, 255, 255)
         
         bw, bh = x2 - x1, y2 - y1
+        if text_style == "dialogue":
+            text_style = self.infer_text_style(text, bw, bh)
+
+        if text_style == "system_card":
+            text = self._format_system_card_text(text)
+
         fs = self.calculate_optimal_font_size(text, bw, bh)
+        if text_style == "scream":
+            fs = min(self.cfg.max_font_size, int(fs * 1.15))
+        elif text_style == "whisper":
+            fs = max(self.cfg.min_font_size, int(fs * 0.90))
+        elif text_style == "system_card":
+            fs = max(self.cfg.min_font_size, int(fs * 0.92))
+
         if self.cfg.enable_dynamic_sizing:
             fs = self.refine_font_size(text, fs, bw, bh)
 
         inner_w = max(10, tw - 2 * self.cfg.padding_horizontal)
         inner_h = max(10, th - 2 * self.cfg.padding_vertical)
         font, fs, lines, lh, sp = self._fit_font_hard(text, fs, inner_w, inner_h)
+        if font is not None:
+            style_font = self.get_font_for_style(fs, text_style, font_hint=font_hint)
+            if style_font is not None:
+                font = style_font
         if not font:
             return img
         
@@ -356,7 +649,11 @@ class TextRenderer:
         
         total_h = len(lines) * lh + (len(lines) - 1) * sp
         
-        if self.cfg.vertical_align == 'center':
+        if use_locked_mode:
+            ys = iy1 + self.cfg.padding_vertical
+        elif text_style == "system_card":
+            ys = iy1 + self.cfg.padding_vertical
+        elif self.cfg.vertical_align == 'center':
             ys = iy1 + (th - total_h) // 2
         elif self.cfg.vertical_align == 'top':
             ys = iy1 + self.cfg.padding_vertical
@@ -369,7 +666,11 @@ class TextRenderer:
             except:
                 lw = len(line) * (fs // 2)
             
-            if self.cfg.horizontal_align == 'center':
+            if use_locked_mode:
+                xp = ix1 + self.cfg.padding_horizontal
+            elif text_style == "system_card":
+                xp = ix1 + self.cfg.padding_horizontal
+            elif self.cfg.horizontal_align == 'center':
                 xp = ix1 + (tw - lw) // 2
             elif self.cfg.horizontal_align == 'left':
                 xp = ix1 + self.cfg.padding_horizontal

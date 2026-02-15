@@ -34,7 +34,12 @@ class Detection:
         self.text_translated: Optional[str] = None
         self.ocr_confidence: float = 0.0
         self.text_regions: List[Dict] = []  # bbox OCR pour inpainting précis
+        self.mask_regions: List[Dict] = []  # masques segmentés précis (SAM/hybride)
         self.ocr_upscale_factor: float = 1.0
+        self.ocr_lines: List[str] = []
+        self.text_style: str = "dialogue"
+        self.text_color_rgb: Optional[Tuple[int, int, int]] = None
+        self.font_hint: str = "regular"
     @property
     def x1(self) -> int:
         return int(self.bbox[0])

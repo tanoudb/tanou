@@ -154,7 +154,77 @@ class PPOCRv5Backend(OCRBackend):
             return "", 0.0, []
 
     def predict_full_image(self, image_path: Path) -> List[Dict]:
-        return []
+        if self.pipeline is None:
+            return []
+
+        try:
+            import cv2
+
+            img = cv2.imread(str(image_path))
+            if img is None:
+                return []
+
+            results = self.pipeline.ocr(img)
+            if not results:
+                return []
+
+            first_result = results[0]
+            regions: List[Dict] = []
+
+            if hasattr(first_result, 'get'):
+                rec_texts = first_result.get('rec_texts', []) or []
+                rec_scores = first_result.get('rec_scores', []) or []
+                dt_polys = first_result.get('dt_polys', []) or []
+
+                for idx, text_value in enumerate(rec_texts):
+                    text = str(text_value).strip()
+                    if not text:
+                        continue
+
+                    conf = float(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+                    if idx >= len(dt_polys):
+                        continue
+
+                    poly = dt_polys[idx]
+                    poly_pts = poly.tolist() if hasattr(poly, 'tolist') else poly
+                    if not poly_pts:
+                        continue
+
+                    xs = [float(p[0]) for p in poly_pts]
+                    ys = [float(p[1]) for p in poly_pts]
+                    bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
+
+                    regions.append({
+                        'bbox': bbox,
+                        'poly': poly_pts,
+                        'text': text,
+                        'conf': conf,
+                    })
+
+            else:
+                for line_result in first_result:
+                    if not line_result or len(line_result) < 2:
+                        continue
+                    bbox_points = line_result[0]
+                    text = str(line_result[1][0]).strip()
+                    conf = float(line_result[1][1])
+                    if not text:
+                        continue
+
+                    xs = [float(p[0]) for p in bbox_points]
+                    ys = [float(p[1]) for p in bbox_points]
+                    bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
+                    regions.append({
+                        'bbox': bbox,
+                        'poly': bbox_points,
+                        'text': text,
+                        'conf': conf,
+                    })
+
+            return regions
+
+        except Exception:
+            return []
 
     def unload(self) -> None:
         if self.pipeline is not None:

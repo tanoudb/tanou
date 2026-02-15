@@ -105,7 +105,14 @@ def main():
         print(f"  Scales: {config.detection.detection_scales}")
         print(f"  Black padding: {config.detection.use_black_padding} (ratio={config.detection.black_padding_ratio})")
         print(f"\nOCR: {config.ocr.backend}")
+        print(f"  OCR primary: {getattr(config.ocr, 'primary_backend', config.ocr.backend)}")
+        print(f"  OCR fallbacks: {getattr(config.ocr, 'fallback_backends', [])}")
+        print(f"  OCR fallback min conf: {getattr(config.ocr, 'fallback_min_confidence', 0.72)}")
         print(f"  Source lang: {config.translation.source_lang}")
+        print(f"\nSegmentation:")
+        print(f"  Precise masks: {config.segmentation.enable_precise_masks}")
+        print(f"  Backend: {config.segmentation.backend}")
+        print(f"  Multi-mask: {config.segmentation.use_multimask}")
         print(f"\nTranslation:")
         print(f"  {config.translation.source_lang.upper()} → {config.translation.target_lang.upper()}")
         print(f"  Cache: {config.translation.enable_cache}")
@@ -117,6 +124,9 @@ def main():
         print(f"\nRendering:")
         print(f"  Inpainting: {config.rendering.inpainting_method}")
         print(f"  Font size: {config.rendering.min_font_size}-{config.rendering.max_font_size}")
+        print(f"  Preserve text color: {config.rendering.preserve_original_text_color}")
+        print(f"  Auto style typesetting: {config.rendering.auto_style_typesetting}")
+        print(f"  Lock text to OCR regions: {config.rendering.lock_text_to_ocr_regions} (system_only={config.rendering.lock_text_system_only})")
         return
     
     # Appliquer arguments
@@ -169,6 +179,7 @@ def main():
     logger.stat("Slicing", "Adaptatif" if config.detection.enable_adaptive_slicing else "Fixe")
     logger.stat("Multi-scale", str(config.detection.detection_scales))
     logger.stat("OCR", str(config.ocr.backend))
+    logger.stat("Segmentation", f"{config.segmentation.backend} (precise={config.segmentation.enable_precise_masks})")
     logger.stat("Translation", f"{config.translation.source_lang.upper()} → {config.translation.target_lang.upper()}")
     logger.stat("Cache", "Activé" if config.translation.enable_cache else "Désactivé")
     

@@ -107,7 +107,7 @@ class DetectionConfig:
     
     # MULTI-SCALE
     enable_multi_scale: bool = True
-    detection_scales: List[float] = field(default_factory=lambda: [1.0, 0.75, 0.5])
+    detection_scales: List[float] = field(default_factory=lambda: [1.25, 1.0, 0.75, 0.5])
     
     multi_scale_fusion: str = "weighted"
     scale_weights: Dict[float, float] = field(default_factory=lambda: {
@@ -120,7 +120,7 @@ class DetectionConfig:
     # names: ['System', 'bulle', 'out_text', 'sfx']
     confidence_thresholds: Dict[str, float] = field(default_factory=lambda: {
         'System': 0.55,
-        'bulle': 0.70,       # Seuil bas pour ne rater aucune bulle
+        'bulle': 0.62,       # Plus sensible pour limiter les bulles manquées
         'out_text': 0.30,    # Texte hors bulle (baissé pour capturer plus)
         'sfx': 0.50          # Effets sonores
     })
@@ -147,7 +147,7 @@ class DetectionConfig:
     filter_border_detections: bool = False   # CHANGÉ: True → False
     border_margin_px: int = 50
     
-    min_box_area: int = 300       # Baissé de 400 → 300
+    min_box_area: int = 180       # Plus permissif pour petites bulles
     max_box_area: int = 800000    # Augmenté de 500000 → 800000
     min_box_ratio: float = 0.1
     max_box_ratio: float = 10.0
@@ -168,8 +168,15 @@ class DetectionConfig:
 
 @dataclass
 class OCRConfig:
-    """Configuration OCR - Priorité PP-OCRv5"""
-    backend = 'ppocr-v5'
+    """Configuration OCR - Priorité PaddleOCR-VL v1.5"""
+    backend = os.environ.get("WEBTOON_OCR_BACKEND", "paddleocr-vl-v1.5").strip().lower()
+    primary_backend: str = os.environ.get("WEBTOON_OCR_PRIMARY", "paddleocr-vl-v1.5").strip().lower()
+    fallback_backends: List[str] = field(default_factory=lambda: [
+        b.strip().lower()
+        for b in os.environ.get("WEBTOON_OCR_FALLBACKS", "ppocr-v5,easyocr").split(",")
+        if b.strip()
+    ])
+    fallback_min_confidence: float = float(os.environ.get("WEBTOON_OCR_FALLBACK_MIN_CONF", "0.72"))
     use_fp16: bool = True
     # Ajoute la ligne ci-dessous :
     paddle_env_path: Path = PADDLE_ENV_PATH
@@ -197,13 +204,45 @@ class OCRConfig:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SEGMENTATION - YOLO PROMPTS → PIXEL MASKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SegmentationConfig:
+    enable_precise_masks: bool = _env_bool("WEBTOON_ENABLE_PRECISE_MASKS", True)
+    backend: str = os.environ.get("WEBTOON_SEGMENTATION_BACKEND", "hybrid")  # hybrid|sam2|ocr_regions
+    sam2_checkpoint: str = os.environ.get("WEBTOON_SAM2_CHECKPOINT", str(OCR_CACHE_DIR / "sam2_b.pt"))
+    use_multimask: bool = _env_bool("WEBTOON_SEGMENTATION_MULTIMASK", True)
+    min_component_area: int = int(os.environ.get("WEBTOON_SEGMENTATION_MIN_COMPONENT", "24"))
+    mask_dilate_kernel: int = int(os.environ.get("WEBTOON_SEGMENTATION_DILATE", "9"))
+    bbox_prompt_margin: int = int(os.environ.get("WEBTOON_SEGMENTATION_PROMPT_MARGIN", "4"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TRANSLATION - NLLB
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class TranslationConfig:
+    backend: str = os.environ.get("WEBTOON_TRANSLATION_BACKEND", "local_llm").strip().lower()
+
+    # NLLB (legacy)
     # CHANGÉ : 600M -> 1.3B pour une meilleure précision
     model_name: str = "facebook/nllb-200-distilled-1.3B"
+
+    # Local LLM (aucune API externe)
+    llm_model_name: str = os.environ.get("WEBTOON_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct")
+    llm_require_cuda: bool = _env_bool("WEBTOON_LLM_REQUIRE_CUDA", True)
+    llm_max_new_tokens: int = int(os.environ.get("WEBTOON_LLM_MAX_NEW_TOKENS", "220"))
+    llm_temperature: float = float(os.environ.get("WEBTOON_LLM_TEMPERATURE", "0.0"))
+    llm_top_p: float = float(os.environ.get("WEBTOON_LLM_TOP_P", "1.0"))
+    llm_repetition_penalty: float = float(os.environ.get("WEBTOON_LLM_REPETITION_PENALTY", "1.05"))
+    llm_prompt_template: str = os.environ.get(
+        "WEBTOON_LLM_PROMPT_TEMPLATE",
+        "You are a professional comic translator. Translate the text from {source_lang} to {target_lang}. "
+        "Preserve meaning, tone, punctuation, and names. Output only the translation, no explanation.\n"
+        "TEXT:\n{text}\nTRANSLATION:"
+    )
     
 
     use_fp16: bool = True  # CRITIQUE pour tes 8 Go de RAM
@@ -296,6 +335,11 @@ class RenderingConfig:
     shadow_offset: Tuple[int, int] = (2, 2)
     shadow_blur: int = 3
 
+    preserve_original_text_color: bool = _env_bool("WEBTOON_PRESERVE_TEXT_COLOR", True)
+    auto_style_typesetting: bool = _env_bool("WEBTOON_AUTO_STYLE_TYPESETTING", True)
+    lock_text_to_ocr_regions: bool = _env_bool("WEBTOON_LOCK_TEXT_TO_OCR_REGIONS", True)
+    lock_text_system_only: bool = _env_bool("WEBTOON_LOCK_TEXT_SYSTEM_ONLY", True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FILTERS
@@ -371,6 +415,7 @@ class Config:
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     ocr: OCRConfig = field(default_factory=OCRConfig)
+    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
     rendering: RenderingConfig = field(default_factory=RenderingConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
