@@ -17,6 +17,7 @@ torchaudio>=2.10
 ultralytics>=8.3
 transformers<5
 sentencepiece>=0.2
+accelerate>=0.33
 
 # Inpainting
 simple-lama-inpainting>=0.1.2

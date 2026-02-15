@@ -103,11 +103,17 @@ def main():
         print(f"  Slicing: {config.detection.enable_adaptive_slicing}")
         print(f"  Window: {config.detection.base_window_height}px")
         print(f"  Scales: {config.detection.detection_scales}")
+        print(f"  Black padding: {config.detection.use_black_padding} (ratio={config.detection.black_padding_ratio})")
         print(f"\nOCR: {config.ocr.backend}")
         print(f"  Source lang: {config.translation.source_lang}")
         print(f"\nTranslation:")
         print(f"  {config.translation.source_lang.upper()} → {config.translation.target_lang.upper()}")
         print(f"  Cache: {config.translation.enable_cache}")
+        print(f"  BitsAndBytes: {config.translation.use_bitsandbytes} (4bit={config.translation.bnb_4bit}, 8bit={config.translation.bnb_8bit})")
+        print(
+            f"  Context grouping: {config.translation.enable_context_grouping} "
+            f"(distance={config.translation.context_distance_threshold}, max_group={config.translation.max_group_size})"
+        )
         print(f"\nRendering:")
         print(f"  Inpainting: {config.rendering.inpainting_method}")
         print(f"  Font size: {config.rendering.min_font_size}-{config.rendering.max_font_size}")

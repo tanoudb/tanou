@@ -9,7 +9,7 @@ Mode --debug : sauvegarde image annotée + crops OCR dans output/debug/
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import time
 import json
 
@@ -63,6 +63,83 @@ class TranslationPipeline:
         except Exception as e:
             self.logger.error(f"Échec initialisation OCR: {e}")
             self.ocr_engine = None
+
+    def _sort_detections_reading_order(self, detections: List[Detection]) -> List[Detection]:
+        """Tri lecture naturelle: haut→bas, puis gauche→droite par ligne."""
+        if not detections:
+            return detections
+
+        sorted_by_y = sorted(detections, key=lambda d: ((d.y1 + d.y2) / 2, d.x1))
+        median_h = sorted([(d.y2 - d.y1) for d in sorted_by_y])[len(sorted_by_y) // 2]
+        row_threshold = max(30, int(median_h * 0.55))
+
+        rows: List[List[Detection]] = []
+        current_row: List[Detection] = []
+        current_row_y: Optional[float] = None
+
+        for det in sorted_by_y:
+            cy = (det.y1 + det.y2) / 2
+            if current_row_y is None or abs(cy - current_row_y) <= row_threshold:
+                current_row.append(det)
+                current_row_y = cy if current_row_y is None else (current_row_y + cy) / 2
+            else:
+                rows.append(sorted(current_row, key=lambda d: d.x1))
+                current_row = [det]
+                current_row_y = cy
+
+        if current_row:
+            rows.append(sorted(current_row, key=lambda d: d.x1))
+
+        ordered: List[Detection] = []
+        for row in rows:
+            ordered.extend(row)
+        return ordered
+
+    def _extract_text_with_retry(self, img: np.ndarray, det: Detection):
+        """OCR principal + retry ciblé si confiance faible."""
+        crop = img[det.y1:det.y2, det.x1:det.x2]
+        if crop.size == 0:
+            return None, 0.0, False, "empty_crop", [], 1.0, "none"
+
+        text, confidence, is_valid, skip_reason, text_regions, upscale_factor = self.ocr_engine.extract_text(crop)
+        if is_valid and confidence >= 0.45:
+            return text, confidence, is_valid, skip_reason, text_regions, upscale_factor, "base"
+
+        # Retry 1: crop élargi (récupère ponctuation/bords de lettres)
+        h_img, w_img = img.shape[:2]
+        margin = 8
+        x1 = max(0, det.x1 - margin)
+        y1 = max(0, det.y1 - margin)
+        x2 = min(w_img, det.x2 + margin)
+        y2 = min(h_img, det.y2 + margin)
+        crop_expand = img[y1:y2, x1:x2]
+
+        if crop_expand.size > 0:
+            t2, c2, v2, r2, reg2, u2 = self.ocr_engine.extract_text(crop_expand)
+            if v2 and c2 >= max(0.35, confidence):
+                return t2, c2, v2, r2, reg2, u2, "expanded"
+
+        # Retry 2: contraste CLAHE + sharpen
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        enhanced = cv2.filter2D(enhanced, -1, sharpen_kernel)
+        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+        t3, c3, v3, r3, reg3, u3 = self.ocr_engine.extract_text(enhanced_bgr)
+        if v3 and c3 >= max(0.35, confidence):
+            return t3, c3, v3, r3, reg3, u3, "clahe_sharpen"
+
+        return text, confidence, is_valid, skip_reason, text_regions, upscale_factor, "base"
+
+    @staticmethod
+    def _compute_global_confidence(det_score: float, ocr_conf: float, lang_conf: float) -> float:
+        """Score global [0..1] basé sur détection + OCR + langue."""
+        det_score = min(1.0, max(0.0, float(det_score)))
+        ocr_conf = min(1.0, max(0.0, float(ocr_conf)))
+        lang_conf = min(1.0, max(0.0, float(lang_conf)))
+        return round(0.35 * det_score + 0.45 * ocr_conf + 0.20 * lang_conf, 3)
     
     # ─────────────────────────────────────────────────────────────────────────
     # DEBUG : Visualisation détections
@@ -220,29 +297,47 @@ class TranslationPipeline:
         
         detections = []
         
-        # ── Barres noires haut/bas pour mieux détecter les bulles au bord ──
-        # YOLO a du mal avec les objets coupés par le bord de l'image.
-        # On ajoute du padding noir (10% de la hauteur) puis on ajuste les coords.
-        pad_h = int(h * 0.03)
-        black_bar_top = np.zeros((pad_h, w, 3), dtype=np.uint8)
-        black_bar_bot = np.zeros((pad_h, w, 3), dtype=np.uint8)
-        img_padded = np.vstack([black_bar_top, img, black_bar_bot])
-        
-        self.logger.info(f"   🔲 Barres noires: +{pad_h}px haut/bas ({w}x{img_padded.shape[0]}px)")
+        # ── Padding noir optionnel haut/bas pour les bords ──
+        # Désactivé par défaut (WEBTOON_USE_BLACK_PADDING=false)
+        use_black_padding = getattr(config.detection, 'use_black_padding', False)
+        pad_h = int(h * max(0.0, float(getattr(config.detection, 'black_padding_ratio', 0.03)))) if use_black_padding else 0
+
+        if pad_h > 0:
+            black_bar_top = np.zeros((pad_h, w, 3), dtype=np.uint8)
+            black_bar_bot = np.zeros((pad_h, w, 3), dtype=np.uint8)
+            img_padded = np.vstack([black_bar_top, img, black_bar_bot])
+            self.logger.info(f"   🔲 Barres noires actives: +{pad_h}px haut/bas ({w}x{img_padded.shape[0]}px)")
+        else:
+            img_padded = img
+            self.logger.info("   🔲 Barres noires: désactivées")
         
         with model_context(lambda: YOLODetector(config.YOLO_MODEL_PATH, self.device)) as detector:
             detections = detector.detect(img_padded, logger=self.logger)
             
-            # Ajuster les coordonnées Y en retirant le padding
-            for det in detections:
-                new_y1 = max(0, int(det.bbox[1]) - pad_h)
-                new_y2 = min(h, int(det.bbox[3]) - pad_h)
-                det.bbox = [det.bbox[0], new_y1, det.bbox[2], new_y2]
+            # Ajuster les coordonnées Y en retirant le padding (si activé)
+            if pad_h > 0:
+                for det in detections:
+                    new_y1 = max(0, int(det.bbox[1]) - pad_h)
+                    new_y2 = min(h, int(det.bbox[3]) - pad_h)
+                    det.bbox = [det.bbox[0], new_y1, det.bbox[2], new_y2]
             
-            # Filtrer les détections complètement dans les barres noires
+            # Filtrer les détections hors image
             detections = [d for d in detections if d.y2 > 0 and d.y1 < h]
             
             translatable_detections = detector.get_translatable_detections(detections)
+
+        # Garde-fou: ne jamais traduire les SFX, même si la config change.
+        pre_filter_count = len(translatable_detections)
+        translatable_detections = [
+            d for d in translatable_detections
+            if str(getattr(d, 'class_name', '')).lower() != 'sfx'
+        ]
+        if len(translatable_detections) != pre_filter_count:
+            self.logger.info(
+                f"   🔇 SFX exclus de la traduction: {pre_filter_count - len(translatable_detections)}"
+            )
+
+        translatable_detections = self._sort_detections_reading_order(translatable_detections)
         
         stats['detections'] = len(detections)
         stats['translatable'] = len(translatable_detections)
@@ -362,12 +457,14 @@ class TranslationPipeline:
                     stats['skipped'] += 1
                     continue
 
-                text, confidence, is_valid, skip_reason, text_regions, upscale_factor = self.ocr_engine.extract_text(crop)
+                text, confidence, is_valid, skip_reason, text_regions, upscale_factor, ocr_strategy = self._extract_text_with_retry(img, det)
                 det.ocr_upscale_factor = upscale_factor  # ✅ Sauvegarder le coefficient
                 det.ocr_confidence = confidence
                 
                 # 🐛 DEBUG : voir pourquoi fallback est rejeté
-                self.logger.info(f"      DEBUG FALLBACK: text='{text}', conf={confidence}, valid={is_valid}, reason={skip_reason}")
+                self.logger.info(
+                    f"      DEBUG FALLBACK: text='{text}', conf={confidence}, valid={is_valid}, reason={skip_reason}, strategy={ocr_strategy}"
+                )
                 
                 if not is_valid:
                     self.logger.info(f"      ⚠️  Ignoré: {skip_reason} (conf={confidence:.2f})")
@@ -377,7 +474,7 @@ class TranslationPipeline:
 
                 det.text_original = text
                 det.text_regions = text_regions
-                self.logger.info(f"      ✓ \"{text}\" ({confidence:.0%}) [{len(text_regions)} régions]")
+                self.logger.info(f"      ✓ \"{text}\" ({confidence:.0%}) [{len(text_regions)} régions, {ocr_strategy}]")
         
         # Filtrer détections sans texte
         valid_detections = [d for d in translatable_detections if d.text_original]
@@ -412,14 +509,48 @@ class TranslationPipeline:
         
         if texts_to_translate:
             with model_context(lambda: NLLBTranslator(self.device)) as translator:
-                self.logger.info(f"\n   🌍 Traduction individuelle ({len(texts_to_translate)} bulles)")
-                
-                # Traduire simplement bulle par bulle
-                translations = translator.translate_batch(texts_to_translate)
-                
-                # Assigner les traductions
-                for det, trans in zip(valid_detections, translations):
-                    det.text_translated = trans
+                if self.debug:
+                    self.logger.info("\n   🔎 Langue source détectée (par bulle)")
+                    for idx, det in enumerate(valid_detections, start=1):
+                        src_text = det.text_original or ""
+                        detected_lang, lang_conf = translator.detect_source_language_with_confidence(src_text)
+                        det.source_lang_detected = detected_lang
+                        det.source_lang_confidence = lang_conf
+                        det.global_confidence = self._compute_global_confidence(det.score, det.ocr_confidence, lang_conf)
+                        preview = src_text.replace("\n", " ").strip()
+                        if len(preview) > 80:
+                            preview = preview[:77] + "..."
+                        self.logger.info(
+                            f"      [{idx:02d}] lang={detected_lang} ({lang_conf:.0%}) | global={det.global_confidence:.0%} | \"{preview}\""
+                        )
+
+                # Toujours alimenter les champs de confiance, même hors debug.
+                for det in valid_detections:
+                    src_text = det.text_original or ""
+                    detected_lang, lang_conf = translator.detect_source_language_with_confidence(src_text)
+                    det.source_lang_detected = detected_lang
+                    det.source_lang_confidence = lang_conf
+                    det.global_confidence = self._compute_global_confidence(det.score, det.ocr_confidence, lang_conf)
+
+                if config.translation.enable_context_grouping:
+                    groups = translator.group_detections_by_context(valid_detections)
+                    self.logger.info(
+                        f"\n   🌍 Traduction contextuelle ({len(valid_detections)} bulles → {len(groups)} groupes)"
+                    )
+                    for group_idx, group in enumerate(groups, start=1):
+                        translator.translate_group(group)
+                        self.logger.info(
+                            f"      Groupe {group_idx}/{len(groups)}: {len(group.detections)} bulle(s)"
+                        )
+                else:
+                    self.logger.info(f"\n   🌍 Traduction individuelle ({len(texts_to_translate)} bulles)")
+
+                    # Traduire simplement bulle par bulle
+                    translations = translator.translate_batch(texts_to_translate)
+
+                    # Assigner les traductions
+                    for det, trans in zip(valid_detections, translations):
+                        det.text_translated = trans
                 
                 cache_stats = translator.get_cache_stats()
                 if cache_stats:
@@ -476,7 +607,11 @@ class TranslationPipeline:
                     'bbox': d.bbox,
                     'original': d.text_original,
                     'translated': d.text_translated,
-                    'confidence': d.ocr_confidence
+                    'confidence': d.ocr_confidence,
+                    'detection_confidence': d.score,
+                    'source_lang_detected': getattr(d, 'source_lang_detected', config.translation.source_lang),
+                    'source_lang_confidence': getattr(d, 'source_lang_confidence', 0.5),
+                    'global_confidence': getattr(d, 'global_confidence', self._compute_global_confidence(d.score, d.ocr_confidence, 0.5))
                 }
                 for d in valid_detections if d.text_translated
             ]

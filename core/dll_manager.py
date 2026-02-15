@@ -20,6 +20,7 @@ class NvidiaDLLManager:
             paddle_env_path: Chemin vers l'environnement Paddle (ex: 'A:\\manwha trad v2\\paddle_env')
         """
         self.paddle_env_path = Path(paddle_env_path)
+        self.is_windows = os.name == "nt"
         self.nvidia_base = self.paddle_env_path / "Lib" / "site-packages" / "nvidia"
         self.torch_lib = self.paddle_env_path / "Lib" / "site-packages" / "torch" / "lib"
         
@@ -67,6 +68,9 @@ class NvidiaDLLManager:
         Returns:
             Nombre de DLLs remplacées
         """
+        if not self.is_windows:
+            return 0
+
         backup_dir = self.torch_lib / "_backup_original_dlls"
         backup_dir.mkdir(parents=True, exist_ok=True)
         
@@ -100,6 +104,11 @@ class NvidiaDLLManager:
         Returns:
             Nombre de répertoires enregistrés
         """
+        if not self.is_windows:
+            if verbose:
+                print("ℹ️  Plateforme non-Windows: enregistrement DLL ignoré")
+            return 0
+
         paddle_libs = self.paddle_env_path / "Lib" / "site-packages" / "paddle" / "libs"
         
         bin_dirs = [
@@ -134,6 +143,9 @@ class NvidiaDLLManager:
         Returns:
             Nombre de DLLs préchargées
         """
+        if not self.is_windows:
+            return 0
+
         loaded = 0
         for subdir, dll_name in self.preload_dlls:
             dll_path = self.nvidia_base / subdir / "bin" / dll_name
@@ -156,6 +168,11 @@ class NvidiaDLLManager:
         Returns:
             Dictionnaire avec les compteurs de chaque étape
         """
+        if not self.is_windows:
+            if verbose:
+                print("ℹ️  Gestion DLL NVIDIA ignorée (non-Windows).")
+            return {'replaced': 0, 'registered': 0, 'preloaded': 0}
+
         if verbose:
             print("🔧 Configuration des DLLs NVIDIA pour PaddleOCR GPU...")
         

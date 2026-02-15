@@ -29,6 +29,50 @@ YOLO_MODEL_PATH = MODEL_DIR / "manhwa_v3.pt"  # Nouveau modèle 4 classes
 OCR_CACHE_DIR = CACHE_DIR / "ocr_weights"
 TRANSLATION_CACHE_DIR = CACHE_DIR / "translation_models"
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discover_font_paths() -> List[str]:
+    """Découvre les polices du projet + chemins optionnels via env."""
+    fonts_dir = ASSETS_DIR / "fonts"
+    font_exts = {".ttf", ".otf", ".ttc"}
+
+    discovered = []
+    if fonts_dir.exists():
+        for font_file in fonts_dir.rglob("*"):
+            if font_file.is_file() and font_file.suffix.lower() in font_exts:
+                discovered.append(str(font_file))
+
+    env_fonts = os.environ.get("WEBTOON_FONT_PATHS", "").strip()
+    if env_fonts:
+        for raw_path in env_fonts.split(os.pathsep):
+            candidate = raw_path.strip()
+            if candidate and Path(candidate).exists():
+                discovered.append(candidate)
+
+    # fallback de secours uniquement si aucune police projet trouvée
+    if not discovered and os.name == 'nt':
+        fallback_windows = [
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/times.ttf",
+            "C:/Windows/Fonts/calibri.ttf",
+        ]
+        discovered.extend([p for p in fallback_windows if Path(p).exists()])
+
+    # dedupe en conservant l'ordre
+    unique_paths = []
+    seen = set()
+    for path in discovered:
+        if path not in seen:
+            seen.add(path)
+            unique_paths.append(path)
+    return unique_paths
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DEVICE & PERFORMANCE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -91,6 +135,10 @@ class DetectionConfig:
     
     multi_scale_nms_iou: float = 0.6
     inter_class_iou_threshold: float = 0.7
+
+    # Padding noir optionnel (hack legacy) autour de l'image avant détection
+    use_black_padding: bool = _env_bool("WEBTOON_USE_BLACK_PADDING", False)
+    black_padding_ratio: float = float(os.environ.get("WEBTOON_BLACK_PADDING_RATIO", "0.03"))
     
     # ── FILTRAGE BORDURES - DÉSACTIVÉ ──
     # Le filtrage des bordures supprimait des détections valides
@@ -107,10 +155,10 @@ class DetectionConfig:
     # ── CLASSES À TRADUIRE - YOLO v3 ──
     # bulle = bulles de dialogue (à traduire)
     # out_text = texte hors bulle (à traduire)
-    # sfx = effets sonores (optionnel, souvent onomatopées)
-    # System = UI/titre (ne pas traduire)
+    # sfx = effets sonores (ne pas traduire)
+    # System = UI/titre (à traduire)
     translatable_classes: List[str] = field(default_factory=lambda: [
-        'bulle', 'out_text'
+        'bulle', 'out_text', 'System'
     ])
 
 
@@ -159,8 +207,13 @@ class TranslationConfig:
     
 
     use_fp16: bool = True  # CRITIQUE pour tes 8 Go de RAM
+    use_bitsandbytes: bool = _env_bool("WEBTOON_USE_BITSANDBYTES", False)
+    bnb_4bit: bool = _env_bool("WEBTOON_BNB_4BIT", True)
+    bnb_8bit: bool = _env_bool("WEBTOON_BNB_8BIT", False)
     
     source_lang: str = "en"
+    auto_detect_source_lang: bool = _env_bool("WEBTOON_AUTO_DETECT_SOURCE_LANG", True)
+    fallback_source_lang: str = os.environ.get("WEBTOON_FALLBACK_SOURCE_LANG", "en").strip().lower() or "en"
     target_lang: str = "fr"
     
     lang_codes: Dict[str, str] = field(default_factory=lambda: {
@@ -180,9 +233,9 @@ class TranslationConfig:
     num_beams: int = 5
     early_stopping: bool = True
     
-    enable_context_grouping: bool = True
-    context_distance_threshold: int = 300
-    max_group_size: int = 5
+    enable_context_grouping: bool = _env_bool("WEBTOON_ENABLE_CONTEXT_GROUPING", True)
+    context_distance_threshold: int = int(os.environ.get("WEBTOON_CONTEXT_DISTANCE_THRESHOLD", "300"))
+    max_group_size: int = int(os.environ.get("WEBTOON_MAX_GROUP_SIZE", "5"))
     group_separator: str = " | "
     
     enable_cache: bool = True
@@ -193,6 +246,14 @@ class TranslationConfig:
     skip_if_no_letters: bool = True
     preserve_ellipsis: bool = True
     preserve_emphasis: bool = True
+
+    # Glossaire/overrides manuels pour cohérence de style
+    forced_translations: Dict[str, str] = field(default_factory=lambda: {
+        "MISO.": "Miso.",
+        "GHISLAIN PERDIUM.": "GHISLAIN PERDIUM.",
+        "YUNHO! HELP ME!": "YUNHO! HELP ME!",
+        "LOOK HERE, MRS. YUJIN JUNG!": "Regardez ici, Mme YUJIN JUNG !"
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -208,12 +269,7 @@ class RenderingConfig:
     background_detection: str = "median_border"
     background_sample_ratio: float = 0.1
     
-    font_paths: List[str] = field(default_factory=lambda: [
-        str(BASE_DIR / "assets" / "fonts" / "Expressives (cris, creepy, peur etc.)" / "creepy"/"BloodyMurder BB.ttf"),
-        "C:/Windows/Fonts/cour.ttf",             # Courier
-        "C:/Windows/Fonts/times.ttf",            # Times New Roman
-        
-        ])
+    font_paths: List[str] = field(default_factory=_discover_font_paths)
     
     enable_dynamic_sizing: bool = True
     target_fill_ratio: float = 0.80

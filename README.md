@@ -32,6 +32,25 @@ python main.py --show-config
 python main.py --debug
 ```
 
+## Docker (Linux CUDA)
+
+Objectif: environnement stable GPU (Torch/OCR) sans gestion manuelle des DLL Windows.
+
+Build + run:
+
+```powershell
+docker compose build
+docker compose up
+```
+
+Les dossiers suivants sont montés en volume:
+- `input/` → `/app/input`
+- `output/` → `/app/output`
+- `logs/` → `/app/logs`
+- `assets/cache/`, `assets/models/`, `assets/fonts/`
+
+Le service utilise `gpus: all` (NVIDIA Container Toolkit requis).
+
 ## Configuration OCR
 
 Dans `config/settings.py` :
@@ -44,6 +63,45 @@ Exemple :
 ```powershell
 $env:PADDLE_ENV_PATH = "A:\manhwa trad v2\.venv311"
 python main.py --debug
+```
+
+## Variables d'environnement utiles
+
+### Détection
+
+- `WEBTOON_USE_BLACK_PADDING=false` (défaut) : désactive le hack barres noires
+- `WEBTOON_BLACK_PADDING_RATIO=0.03` : ratio si padding activé
+
+### Traduction (VRAM)
+
+- `WEBTOON_USE_BITSANDBYTES=true|false` : active la quantification NLLB
+- `WEBTOON_BNB_4BIT=true|false` : mode 4-bit (recommandé)
+- `WEBTOON_BNB_8BIT=true|false` : mode 8-bit (alternative)
+- `WEBTOON_AUTO_DETECT_SOURCE_LANG=true|false` : détecte automatiquement la langue OCR
+- `WEBTOON_FALLBACK_SOURCE_LANG=en` : langue source de secours si détection incertaine
+
+Exemple PowerShell:
+
+```powershell
+$env:WEBTOON_USE_BITSANDBYTES = "true"
+$env:WEBTOON_BNB_4BIT = "true"
+$env:WEBTOON_BNB_8BIT = "false"
+python main.py --show-config
+```
+
+### Regroupement contextuel (ordre de lecture)
+
+- `WEBTOON_ENABLE_CONTEXT_GROUPING=true|false`
+- `WEBTOON_CONTEXT_DISTANCE_THRESHOLD=300` (augmenter pour fusionner plus de bulles proches)
+- `WEBTOON_MAX_GROUP_SIZE=5`
+
+Preset conseillé pour webtoons longs:
+
+```powershell
+$env:WEBTOON_ENABLE_CONTEXT_GROUPING = "true"
+$env:WEBTOON_CONTEXT_DISTANCE_THRESHOLD = "420"
+$env:WEBTOON_MAX_GROUP_SIZE = "7"
+python main.py --show-config
 ```
 
 ## DLL Hell (NVIDIA)

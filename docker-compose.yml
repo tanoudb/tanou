@@ -1,0 +1,22 @@
+services:
+  webtoon-translator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: webtoon-translator:cuda
+    container_name: webtoon-translator
+    gpus: all
+    environment:
+      WEBTOON_USE_BLACK_PADDING: "false"
+      WEBTOON_BLACK_PADDING_RATIO: "0.03"
+      WEBTOON_USE_BITSANDBYTES: "true"
+      WEBTOON_BNB_4BIT: "true"
+      WEBTOON_BNB_8BIT: "false"
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./logs:/app/logs
+      - ./assets/cache:/app/assets/cache
+      - ./assets/models:/app/assets/models
+      - ./assets/fonts:/app/assets/fonts
+    command: ["python", "main.py", "--debug"]
